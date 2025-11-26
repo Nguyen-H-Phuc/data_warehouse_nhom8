@@ -1,0 +1,275 @@
+# =========================================================
+# 4. LOAD DATA FROM DW → DATAMART + GHI LOG (MARIA DB)
+# ===== WORKFLOW 4.X – FULL COMMENTS MATCH DRAW.IO ========
+# =========================================================
+
+import pandas as pd
+from sqlalchemy import create_engine, text
+import sys, io
+
+# ====================================================
+# 4.1 Unicode setup
+# ====================================================
+try:
+    sys.stdout.reconfigure(encoding='utf-8')
+    sys.stderr.reconfigure(encoding='utf-8')
+except:
+    sys.stdout = io.TextIOWrapper(sys.stdout.buffer, encoding='utf-8')
+    sys.stderr = io.TextIOWrapper(sys.stderr.buffer, encoding='utf-8')
+
+
+# ====================================================
+# 4.2 Đọc connection.txt
+#   4.2.1 Kiểm tra file tồn tại?
+#   4.2.2 Mở file
+#   4.2.3 Trả dictionary config
+#   4.2.4 Báo lỗi nếu không đọc được file
+# ====================================================
+def read_file():
+    params = {}
+    try:
+        # 4.2.2 Mở file
+        with open(r'D:\ETL_STockDW\connection.txt', 'r') as f:
+            # 4.2.3 Trả dictionary config
+            for line in f:
+                if '=' in line:
+                    key, value = line.strip().split('=', 1)
+                    params[key.strip()] = value.strip()
+        return params
+
+    except Exception as e:
+        # 4.2.4 Báo lỗi → END
+        print("❌ 4.2 Không thể đọc file connection.txt:", e)
+        sys.exit(1)
+
+
+# ====================================================
+# 4.3 Tạo chuỗi kết nối (DW, MART, CONFIG)
+# ====================================================
+def get_connection_strings(p):
+    return {
+        "dw":     f"mariadb+mariadbconnector://{p['user']}:{p['password']}@{p['host']}:3306/{p['db_dw']}",
+        "mart":   f"mariadb+mariadbconnector://{p['user']}:{p['password']}@{p['host']}:3306/{p['db_mart']}",
+        "config": f"mariadb+mariadbconnector://{p['user']}:{p['password']}@{p['host']}:3306/{p['db_config']}"
+    }
+
+
+# ====================================================
+# 4.4 Kết nối DW & Lấy dữ liệu
+#   4.4.1 Kiểm tra kết nối DW?
+#   4.4.2 Lấy dữ liệu DW
+#   4.4.3 Báo lỗi nếu không kết nối được
+# ====================================================
+def load_dw_data(engine_dw):
+    try:
+        # 4.4.2 Truy vấn DW
+        query = """
+            SELECT 
+                d.full_date AS trade_date,
+                s.symbol AS symbol,
+                f.close_price,
+                f.open_price,
+                f.high_price,
+                f.low_price,
+                f.volume
+            FROM fact_stock_daily f
+            JOIN dim_date d ON f.date_sk = d.date_sk
+            JOIN dim_stock s ON f.stock_sk = s.stock_sk
+            ORDER BY s.symbol, d.full_date
+        """
+        df = pd.read_sql(query, engine_dw)
+
+        if df.empty:
+            print("⚠ 4.4.2 DW không có dữ liệu")
+
+        return df
+
+    except Exception as e:
+        # 4.4.3 Kết nối lỗi
+        raise Exception(f"4.4 Lỗi load dữ liệu từ DW: {e}")
+
+
+# ====================================================
+# 4.5 Build dm_price_summary
+#   4.5.1 Tính % thay đổi & prev_close
+#   4.5.2 Chuẩn hóa dữ liệu (fill NaN)
+# ====================================================
+def build_dm_price_summary(df_dw):
+    try:
+        if df_dw.empty:
+            raise Exception("4.5 Không có dữ liệu DW để tạo dm_price_summary")
+
+        # 4.5.1 Tính % thay đổi
+        df_dw["prev_close"] = df_dw.groupby("symbol")["close_price"].shift(1)
+        df_dw["percent_change"] = ((df_dw["close_price"] - df_dw["prev_close"]) /
+                                   df_dw["prev_close"] * 100)
+
+        # 4.5.2 Chuẩn hóa dữ liệu
+        df_dw["prev_close"] = df_dw["prev_close"].fillna(0)
+        df_dw["percent_change"] = df_dw["percent_change"].fillna(0)
+
+        df_dm = df_dw[[
+            "symbol", "trade_date", "close_price", "high_price",
+            "low_price", "volume", "prev_close", "percent_change"
+        ]]
+
+        return df_dm
+
+    except Exception as e:
+        raise Exception(f"4.5 Lỗi xử lý dm_price_summary: {e}")
+
+
+# ====================================================
+# 4.6 Ghi dm_price_summary
+#   4.6.1 Kết nối Mart?
+#   4.6.2 Xóa dữ liệu cũ
+#   4.6.3 Insert dữ liệu mới
+#   4.6.4 Báo lỗi nếu thất bại
+# ====================================================
+def load_dm_price_summary(df_dm, engine_mart):
+    try:
+        # 4.6.2 Xóa dữ liệu cũ
+        with engine_mart.connect() as conn:
+            conn.execute(text("TRUNCATE TABLE dm_price_summary"))
+            conn.commit()
+
+        # 4.6.3 Insert
+        df_dm.to_sql("dm_price_summary", engine_mart, if_exists="append", index=False)
+
+        print("✅ 4.6 Load dm_price_summary thành công!")
+
+    except Exception as e:
+        raise Exception(f"4.6 Lỗi load dm_price_summary: {e}")
+
+
+# ====================================================
+# 4.7 Build rpt_stock_performance
+#   4.7.1 Chọn cột
+#   4.7.2 Đổi tên
+#   4.7.3 Tạo status
+# ====================================================
+def build_rpt_stock_performance(df_dm):
+    try:
+        # 4.7.1 Chọn cột
+        rpt = df_dm[[
+            "trade_date", "symbol", "close_price",
+            "volume", "percent_change"
+        ]].copy()
+
+        # 4.7.2 Đổi tên
+        rpt.rename(columns={
+            "trade_date": "report_date",
+            "percent_change": "price_change_percentage"
+        }, inplace=True)
+
+        # 4.7.3 Tạo status Up / Down / NoChange
+        def classify(x):
+            if x > 0:
+                return "UP"
+            elif x < 0:
+                return "DOWN"
+            return "NO_CHANGE"
+
+        rpt["status"] = rpt["price_change_percentage"].apply(classify)
+
+        return rpt
+
+    except Exception as e:
+        raise Exception(f"4.7 Lỗi xử lý rpt_stock_performance: {e}")
+
+
+# ====================================================
+# 4.8 Load rpt_stock_performance vào Mart
+#   4.8.1 Kết nối Mart?
+#   4.8.2 Xóa dữ liệu cũ
+#   4.8.3 Insert dữ liệu mới
+# ====================================================
+def load_rpt_stock_performance(df_rpt, engine_mart):
+    try:
+        # 4.8.2 Xóa dữ liệu cũ
+        with engine_mart.connect() as conn:
+            conn.execute(text("TRUNCATE TABLE rpt_stock_performance"))
+            conn.commit()
+
+        # 4.8.3 Insert dữ liệu mới
+        df_rpt.to_sql("rpt_stock_performance", engine_mart, if_exists="append", index=False)
+
+        print("✅ 4.8 Load rpt_stock_performance thành công!")
+
+    except Exception as e:
+        raise Exception(f"4.8 Lỗi load rpt_stock_performance: {e}")
+
+
+# ====================================================
+# 4.9 Ghi log vào etl_log
+#   4.9.1 Kết nối config?
+#   4.9.2 Insert log
+# ====================================================
+def write_log(engine_cfg, process_name, status, message="", records_inserted=0):
+    try:
+        # 4.9.2 Insert log
+        with engine_cfg.connect() as conn:
+            conn.execute(text("""
+                INSERT INTO etl_log 
+                (process_name, stock_symbol, source_url, start_time, end_time,
+                 records_inserted, status, message)
+                VALUES 
+                (:pname, NULL, NULL, NOW(), NOW(), :rec, :st, :msg)
+            """), {
+                "pname": process_name,
+                "rec": records_inserted,
+                "st": status,
+                "msg": message
+            })
+            conn.commit()
+
+    except Exception as e:
+        print("❌ Không thể ghi log:", e)
+
+
+# ====================================================
+# 4.10 MAIN FLOW — MATCH WORKFLOW 100%
+# ====================================================
+if __name__ == "__main__":
+
+    process_name = "DW_TO_DATAMART"
+
+    try:
+        print("=== 4.0 BẮT ĐẦU LOAD DATAMART ===")
+
+        # 4.2 đọc config (bao gồm 4.2.1 → 4.2.4)
+        params = read_file()
+
+        # 4.3 tạo chuỗi kết nối
+        conn_strings = get_connection_strings(params)
+
+        # 4.4 kết nối DW, MART, CONFIG
+        engine_dw = create_engine(conn_strings["dw"])
+        engine_mart = create_engine(conn_strings["mart"])
+        engine_cfg = create_engine(conn_strings["config"])
+
+        # 4.4.2 load dữ liệu DW
+        df_dw = load_dw_data(engine_dw)
+
+        # 4.5 build dm_price_summary
+        df_dm = build_dm_price_summary(df_dw)
+
+        # 4.6 load dm_price_summary → mart
+        load_dm_price_summary(df_dm, engine_mart)
+
+        # 4.7 build report
+        df_rpt = build_rpt_stock_performance(df_dm)
+
+        # 4.8 load report vào mart
+        load_rpt_stock_performance(df_rpt, engine_mart)
+
+        # 4.9 ghi log SUCCESS
+        total_rows = len(df_dm) + len(df_rpt)
+        write_log(engine_cfg, process_name, "SUCCESS", "", total_rows)
+
+        print("=== 4.0 HOÀN THÀNH LOAD DATAMART ===")
+
+    except Exception as e:
+        # 4.9 ghi log FAIL
+        write_log(engine_cfg, process_name, "FAIL", str(e), 0)
+        print("❌ 4.x Lỗi toàn trình:", e)
